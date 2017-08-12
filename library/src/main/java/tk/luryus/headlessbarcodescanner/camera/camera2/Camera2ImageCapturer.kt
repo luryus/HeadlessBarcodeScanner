@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
+import kotlinx.coroutines.experimental.CompletableDeferred
 import tk.luryus.headlessbarcodescanner.camera.ImageCapturer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -21,6 +22,7 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
     private var camBackgroundThread: HandlerThread? = null
     private var camBackgroundHandler: Handler? = null
     private val openCloseCamLock: Semaphore = Semaphore(1)
+    private var startDeferred: CompletableDeferred<Unit>? = null
 
     private val camera: CameraHolder
 
@@ -35,13 +37,20 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
         override fun onOpened(device: CameraDevice) {
             openCloseCamLock.release()
             cameraDevice = device
-            createCameraSession()
+
+            try {
+                createCameraSession()
+            } catch(e: Exception) {
+                finishStartTask(e)
+            }
         }
 
         override fun onDisconnected(device: CameraDevice) {
             openCloseCamLock.release()
             device.close()
             cameraDevice = null
+
+            finishStartTask(RuntimeException("Opening camera failed: camera disconnected"))
         }
 
         override fun onError(device: CameraDevice, error: Int) {
@@ -50,6 +59,7 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
             cameraDevice = null
 
             Log.e(TAG, "Error with camera device: $error")
+            finishStartTask(RuntimeException("Opening camera failed: $error"))
         }
     }
 
@@ -60,10 +70,19 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
     override var onImageCapturedListener: ((Image) -> Unit)? = null
 
     @Synchronized
-    override fun start() {
-        startBackgroundThread()
-        imageReader = createImageReader()
-        openCamera()
+    override fun start(): CompletableDeferred<Unit> {
+        val startCompDef = CompletableDeferred<Unit>()
+        startDeferred = startCompDef
+
+        try {
+            startBackgroundThread()
+            imageReader = createImageReader()
+            openCamera()
+        } catch(e: Exception) {
+            finishStartTask(e)
+        }
+
+        return startCompDef
     }
 
     @Synchronized
@@ -104,40 +123,41 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
                     "Trying to create camera session while imageReader or cameraDevice is null")
         }
 
-        try {
-            val surface = reader.surface
-            val requestBuilder = camDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                    .also { it.addTarget(surface) }
-            requestBuilder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE,
-                    CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF)
-            requestBuilder.set(CaptureRequest.STATISTICS_HOT_PIXEL_MAP_MODE, false)
-            requestBuilder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
-                    CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_OFF)
-            requestBuilder.set(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            captureRequest = requestBuilder.build()
+        val surface = reader.surface
+        val requestBuilder = camDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                .also { it.addTarget(surface) }
+        requestBuilder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE,
+                CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF)
+        requestBuilder.set(CaptureRequest.STATISTICS_HOT_PIXEL_MAP_MODE, false)
+        requestBuilder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+                CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_OFF)
+        requestBuilder.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        captureRequest = requestBuilder.build()
 
-            camDevice.createCaptureSession(listOf(surface),
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigureFailed(session: CameraCaptureSession) {
-                            throw RuntimeException("Configuring camera session failed")
+        camDevice.createCaptureSession(listOf(surface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        Log.w(TAG, "Configuring camera session failed")
+                        finishStartTask(RuntimeException("Configuring camera session failed"))
+                    }
+
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        if (cameraDevice == null) {
+                            // the camera has already been closed
+                            finishStartTask()
                         }
 
-                        override fun onConfigured(session: CameraCaptureSession) {
-                            if (cameraDevice == null) {
-                                // the camera has already been closed
-                                return
-                            }
-
-                            // start fetching images
+                        try {// start fetching images
                             cameraCaptureSession = session
                             startCaptureTimer()
+                            finishStartTask()
+                        } catch(e: Exception) {
+                            finishStartTask(e)
                         }
-                    }, null)
-        } catch (e: CameraAccessException) {
-            e.printStackTrace()
-        }
+                    }
+                }, null)
     }
 
     private fun startCaptureTimer() {
@@ -201,6 +221,7 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
             }
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Could not access camera", e)
+            throw e
         }
     }
 
@@ -215,7 +236,6 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
                 it.close()
                 cameraDevice = null
             }
-
             imageReader?.let {
                 it.close()
                 imageReader = null
@@ -245,34 +265,39 @@ class Camera2ImageCapturer(private val ctx: Context) : ImageCapturer {
         }
     }
 
-    companion object {
-        private val TAG = "Cam2ImageReader"
+    private fun finishStartTask(err: Exception? = null): Unit {
+        if (startDeferred?.isActive != true) return
 
-        private val IMAGE_WIDTH = 320
-        private val IMAGE_HEIGHT = 240
-        private val CAM_OUTPUT_SIZE = Size(IMAGE_WIDTH, IMAGE_HEIGHT)
-        private val SUPPORTED_IMAGE_FORMATS = arrayOf(ImageFormat.YUV_420_888, ImageFormat.JPEG)
-        private val CAPTURE_INTERVAL = 250L
-
-        private fun isValidCamera(cam: CameraHolder): Boolean {
-            if (cam.isRearFacing()) {
-                val formats = cam.supportedFormats
-
-                for (format in SUPPORTED_IMAGE_FORMATS) {
-                    if (formats.contains(format) && camSupportsImageFormat(cam, format)) {
-                        return true
-                    } else {
-                        Log.i(TAG, "Rear-facing camera $cam does not support image format $format"
-                                + " with size $CAM_OUTPUT_SIZE")
-                    }
-                }
-            }
-
-            return false
-        }
-
-        private fun camSupportsImageFormat(cam: CameraHolder, imageFormat: Int): Boolean {
-            return cam.getSupportedSizesForFormat(imageFormat)?.contains(CAM_OUTPUT_SIZE) ?: false
+        if (err == null) {
+            startDeferred?.complete(Unit)
+        } else {
+            startDeferred?.completeExceptionally(err)
         }
     }
+
+    companion object {
+        private const val TAG = "Cam2ImageReader"
+
+        private const val IMAGE_WIDTH = 320
+        private const val IMAGE_HEIGHT = 240
+        internal val CAM_OUTPUT_SIZE = Size(IMAGE_WIDTH, IMAGE_HEIGHT)
+        internal val SUPPORTED_IMAGE_FORMATS = arrayOf(ImageFormat.YUV_420_888, ImageFormat.JPEG)
+        private const val CAPTURE_INTERVAL = 250L
+
+    }
+}
+
+private fun isValidCamera(cam: CameraHolder): Boolean {
+    if (cam.isRearFacing()) {
+        val formats = cam.supportedFormats
+
+        return Camera2ImageCapturer.SUPPORTED_IMAGE_FORMATS
+                .any { formats.contains(it) && camSupportsImageFormat(cam, it) }
+    }
+
+    return false
+}
+
+private fun camSupportsImageFormat(cam: CameraHolder, imageFormat: Int): Boolean {
+    return cam.getSupportedSizesForFormat(imageFormat)?.contains(Camera2ImageCapturer.CAM_OUTPUT_SIZE) ?: false
 }

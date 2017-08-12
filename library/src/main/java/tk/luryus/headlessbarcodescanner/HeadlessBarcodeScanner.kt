@@ -3,6 +3,8 @@ package tk.luryus.headlessbarcodescanner
 import android.content.Context
 import android.media.Image
 import com.google.zxing.DecodeHintType
+import kotlinx.coroutines.experimental.CommonPool
+import kotlinx.coroutines.experimental.launch
 import tk.luryus.headlessbarcodescanner.barcode.BarcodeReader
 import tk.luryus.headlessbarcodescanner.barcode.BarcodeResult
 import tk.luryus.headlessbarcodescanner.barcode.DefaultBarcodeReader
@@ -25,9 +27,17 @@ class HeadlessBarcodeScanner private constructor(
         imageCapturer.onImageCapturedListener = this::handleImageCaptured
     }
 
-    fun start() {
+    fun start(onComplete: () -> Unit, onError: (Exception) -> Unit) {
         previousResult = null
-        imageCapturer.start()
+
+        launch(CommonPool) {
+            try {
+                imageCapturer.start().await()
+                onComplete.invoke()
+            } catch(e: Exception) {
+                onError.invoke(e)
+            }
+        }
     }
 
     fun stop() {
